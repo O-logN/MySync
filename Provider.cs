@@ -1,15 +1,11 @@
 using System.Runtime.InteropServices;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
 using Microsoft.Identity.Client;
 using Microsoft.Identity.Client.Broker;
 using Microsoft.Identity.Client.Extensions.Msal;
 
 class Provider
 {
-	const string ClientId = ; // Ive purposely removed it
+	const string ClientId = ""; // not a secret, but why should I leave it ?
 	readonly PublicClientApplication _app;
 	
 	Provider(string clientId)
@@ -26,10 +22,7 @@ class Provider
 	{
 		var provider = new Provider(ClientId); // [3]
 		var tmp = await MsalCacheHelper.CreateAsync(
-			new StorageCreationPropertiesBuilder(
-				FileManager.GetCacheFileName(),
-				FileManager.GetMySyncPath()
-			).Build()
+			new StorageCreationPropertiesBuilder(FileManager.CacheFileName, FileManager.MySyncPath).Build()
 		);
 		tmp.RegisterCache(provider._app.UserTokenCache);
 		return provider;
@@ -51,7 +44,7 @@ class Provider
 							.WithPrompt(Prompt.SelectAccount)
 							.ExecuteAsync(cToken)).AccessToken;
 
-		return (await _app.GetAccountsAsync(cToken)).Count() > 1 ? // [8]
+		return (await _app.GetAccountsAsync(cToken)).Count() > 1 ?
 				throw new InvalidOperationException("Another account is already in cache.") : ans;
 	}
 	
@@ -118,9 +111,6 @@ class Provider
 	[7]
 		Check:
 			https://learn.microsoft.com/en-us/entra/msal/dotnet/advanced/exceptions/
-
-	[8]
-		This is to enforce the assumption made in [0] of Program.cs.
 
 	[9]
 		The following introduces the GetConsoleOrTerminalWindow() method. Based on:

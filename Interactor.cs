@@ -1,17 +1,11 @@
-using System.IO;
-using System.Threading;
 using System.Threading.Channels;
-using System.Threading.Tasks;
 using Dapper;
 using Microsoft.Data.Sqlite;
 using DbOperations;
 
 class Interactor
 {
-	readonly string _connectionString;
-
-	internal Interactor()
-		=> _connectionString = $"Data Source={FileManager.GetDbPath()};Default Timeout=1"; // [0]
+	readonly string _connectionString = $"Data Source={FileManager.DbPath};Default Timeout=1"; // [0]
 	
 	internal async Task RunAsync(ChannelReader<DbOperation> operationReader, CancellationToken cToken)
 	{
@@ -21,10 +15,9 @@ class Interactor
 			{
 				if (cToken.IsCancellationRequested)
 				{
-					Logger.PrintError("Interactor.RunAsync()",
-									 $"Cancellation requested, skipping the execution of:\t{operation}");
-					if (operation is GetPendingActions)
-						((GetPendingActions)operation).Tcs.SetCanceled();
+					this.PrintError($"Skipping the execution of:\n\t{operation}\nbecause cancellation was requested");
+					if (operation is GetEvents op)
+						op.Cancel();
 					break;
 				}
 				try
@@ -36,9 +29,7 @@ class Interactor
 					break;
 				}
 				catch (Exception ex) // [3]
-				{
-					Logger.PrintError("Interactor.RunAsync()", ex);
-				}
+					{ this.PrintError(ex); }
 				try
 					{ await Task.Delay(TimeSpan.FromSeconds(1), cToken); }
 				catch (OperationCanceledException)
@@ -50,9 +41,9 @@ class Interactor
 
 /*
 	[0]
-		I change the default timeout so that an operation executed through "connection" cannot block the Interactor
-		for much time. The loop allows retries anyway. I dont use ExecuteAsync() or similar because the Dapper docs
-		seem incomplete: for instance, I cant find how to pass a cancellationToken to that method.
+		The default timeout is 30 seconds:
+			https://learn.microsoft.com/en-us/dotnet/standard/data/sqlite/connection-strings#:~:text=The%20default%20value%20is%2030.
+		Lowering to 1 seconds makes the Interactors more responsive. The retry loop already covers further retries. 
 
 	[1]
 		Interactor.RunAsync(), an asynchronous task, may be executed by different threads during the application life. 
@@ -62,9 +53,8 @@ class Interactor
 		So, I prefer to bound the lifetime of a connection object to a synchronous portion of the method.
 
 	[2]
-		I use the default "rollback journal" mode (choosing WAL implies understanding its tradeoffs, which doesnt
-		seem to be worth the effort here). In order to ensure that transactions are durable,
-		I then set synchronous to Extra. Check https://sqlite.org/pragma.html#pragma_synchronous
+		I use the default "rollback journal" mode. I set synchronous = EXTRA to ensure that transactions are durable.
+		Check https://sqlite.org/pragma.html#pragma_synchronous
 
 	[3]
 		The docs of Dapper dont seem to clarify what exceptions may be thrown.

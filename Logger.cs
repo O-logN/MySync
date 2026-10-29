@@ -1,28 +1,34 @@
 using System.Globalization;
-using System.Net.Http;
+using System.Runtime.CompilerServices;
 using Microsoft.Data.Sqlite;
 using Microsoft.Identity.Client;
 
 static class Logger
 {
+	internal static bool WasPrintErrorCalled { get; set; } = false; // [1]
 	enum Level { Success, Info, Error };
 	static readonly Lock _consoleLock = new();
-	internal static bool WasPrintErrorCalled { get; set; } = false;
 
-    internal static void PrintSuccess(string? sender, string msg)
-        => PrintMsg(Level.Success, sender, msg);
+    internal static void PrintSuccess(string msg)
+        => PrintMsg(Level.Success, null, msg);
 
-    internal static void PrintInfo(string? sender, string msg)
-        => PrintMsg(Level.Info, sender, msg);
+    internal static void PrintInfo(string msg)
+        => PrintMsg(Level.Info, null, msg);
 
-    internal static void PrintError(string sender, string msg)
+    internal static void PrintError<T>(this T caller, string msg, [CallerMemberName] string memberName = "") where T : notnull // [2]
+		=> PrintError($"{caller.GetType()}.{memberName}()", msg);
+
+    internal static void PrintError<T>(this T caller, Exception ex, [CallerMemberName] string memberName = "") where T : notnull
+		=> PrintError($"{caller.GetType()}.{memberName}()", ex);
+
+    static void PrintError(string sender, string msg)
     {
 		WasPrintErrorCalled = true;
 		PrintMsg(Level.Error, sender, msg);
 		Console.Beep();
 	}
 
-    internal static void PrintError(string sender, Exception ex)
+    static void PrintError(string sender, Exception ex)
     {
         WasPrintErrorCalled = true;
 		string moreInfo = ex switch
@@ -38,16 +44,16 @@ static class Logger
 
     static void PrintMsg(Level level, string? sender, string msg)
     {
-		using (_consoleLock.EnterScope()) // [1]
+		using (_consoleLock.EnterScope()) // [3]
         {
-			Console.Write(DateTime.Now.ToString(new CultureInfo("it-IT")));
+			Console.Write(DateTime.Now.ToString("T", new CultureInfo("it-IT")));
 			Console.Write("\t");
 			
             var startColor = Console.ForegroundColor;
 			Console.ForegroundColor = level switch
 			{
 				Level.Success => ConsoleColor.Green,
-				Level.Info => startColor,
+				Level.Info => ConsoleColor.Yellow,
 				Level.Error => ConsoleColor.Red,
 				_ => throw new ArgumentException($"Unsupported level: {level}")
 			};
@@ -56,12 +62,19 @@ static class Logger
 
 			if (sender is not null)
 				Console.Write($" reported by {sender}");
-			Console.Write($":\t{msg}\n");
+			Console.Write($"\t{msg}\n");
         }
     }
 }
 
 /*
 	[1]
+		This is to avoid making the console close if an error was logged, despite "q" having been entered
+		(see Program.cs).
+
+	[2]
+		https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/attributes/caller-information
+		
+	[3]
 		So that two different PrintMsg() calls cannot mix up.
 */

@@ -1,12 +1,7 @@
-﻿using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Threading;
-using System.Threading.Channels;
-using System.Threading.Tasks;
+﻿using System.Threading.Channels;
 using DbOperations;
 
-class Program // [0]
+class Program
 {
 	static async Task Main()
 	{
@@ -16,45 +11,44 @@ class Program // [0]
 		var evaluator = new Evaluator();
 		var interactor = new Interactor();
 		var provider = await Provider.CreateAsync();
-		var uploader = await Uploader.CreateAsync(cTokenSource.Token); // [3]
+		var uploader = await Uploader.CreateAsync(cTokenSource.Token); // [1] , [2]
 		
-		var eventChannel = Channel.CreateUnbounded<FileSystemEventArgs>(); // [1]
+		var eventChannel = Channel.CreateUnbounded<Event>(); // [3]
 		var operationChannel = Channel.CreateUnbounded<DbOperation>();
 
-		var interactorTask = interactor.RunAsync(operationChannel.Reader, cTokenSource.Token); // [2]
+		var interactorTask = interactor.RunAsync(operationChannel.Reader, cTokenSource.Token); // [4]
 		operationChannel.Writer.TryWrite(new InitDb());
 		var evaluatorTask = evaluator.RunAsync(eventChannel.Reader, operationChannel.Writer, cTokenSource.Token);
 		var uploaderTask = uploader.RunAsync(operationChannel.Writer, provider, cTokenSource.Token);
 		watcher.Start(eventChannel.Writer);
-
+		
 		bool shouldRun = true;
-		Logger.PrintInfo(null, "Enter \"h\" to print the menu.");
+		Logger.PrintInfo("Enter \"h\" to print the menu.");
 		while (shouldRun)
 		{
 			switch (Console.ReadLine())
 			{
 				case "h":
-					Logger.PrintInfo(null,"\n"+
+					Logger.PrintInfo("\n"+
 					"""
 						h -> print menu
-						s -> stop or prevent Uploader suspension
-						q -> quit\n
+						w -> wake up the Uploader
+						q -> quit
 					""");
 					break;
 					
-				case "s":
+				case "w":
 					uploader.StopSuspension();
 					break;
 			
 				case "q":
 					watcher.Stop();
 					eventChannel.Writer.Complete();
+					cTokenSource.Cancel();
 					await evaluatorTask;
 					operationChannel.Writer.Complete();
-					cTokenSource.Cancel();
 					await interactorTask;
-					if (!uploader.HasFinished)
-						uploader.StopSuspension();
+					uploader.StopSuspension();
 					await uploaderTask;
 					shouldRun = false;
 					break;
@@ -62,30 +56,29 @@ class Program // [0]
 		}
 		if (Logger.WasPrintErrorCalled)
 		{
-			Logger.PrintInfo(null, "\nPress any key to continue\n");
+			Logger.PrintInfo("\nPress any key to continue\n");
 			Console.ReadKey(true);
 		}
 	}
 }
 
 /*
-	[0]
-		to be done.
-
 	[1]
-		In this program, we only use unbounded channels.
+		Despite the presence of a cancellation token, the task is not interruptible. This is because cToken
+		can be canceled only if the user types "q" on the console, but the "await" blocks the current method.
+		This is not a problem as the task will end within a few seconds.
+	
+	[2]
+		If the Uploader cannot read signature.txt (despite retries), then an exception is thrown. Note that
+		failing to read the signature does not prevent the whole program to function, but for simplicity I still let
+		it end.
+
+	[3]
+		In this program I only use unbounded channels.
 		So, TryComplete() always succeeds unless the channel got completed. Check:
 			https://learn.microsoft.com/en-us/dotnet/core/extensions/channels#:~:text=used%20with%20an-,unbounded%20channel,-%2C%20this%20always%20returns
 
-	[2]
+	[4]
 		This order ensures that the Main() thread returns immediately from any RunAsync(), so that it can immediately
-		listen to the console.
-
-	[3]
-		Despite the presence of a cToken, the task is not interruptible. That's just because the method execution
-		gets blocked. So, the user has either to wait that FileManager.OpenWithRetries() gives up (requires some seconds)
-		or to force the program to close. The latter seems ok, because except for the cTokenSource there are not resources
-		that should be disposed (I suppose that not disposing cTokenSource is not a problem). I could have made the
-		Uploader creation be asynchronous, but that would have resulted in more difficult code (that doesnt seem to be
-		worth the effort).
+		enter the console loop.
 */

@@ -1,174 +1,82 @@
-using System.IO;
-using static System.IO.WatcherChangeTypes;
-using System.Threading;
 using System.Threading.Channels;
-using System.Threading.Tasks;
 using DbOperations;
-using static DbOperations.ActionType;
+using static DbOperations.EventType;
 
 class Evaluator
 {
-	readonly string _syncPath;
-	
-	internal Evaluator()
-		=> _syncPath = FileManager.GetSyncPath();
-	
-	internal async Task RunAsync(ChannelReader<FileSystemEventArgs> eventReader,
-								 ChannelWriter<DbOperation> operationWriter, CancellationToken cToken)
+	internal async Task RunAsync(ChannelReader<Event> eventReader, ChannelWriter<DbOperation> operationWriter, CancellationToken cToken)
 	{
+		var whitelist = await TryReadWhitelistAsync(cToken) ?? [];
 		await foreach (var e in eventReader.ReadAllAsync())
 		{
-			if (e.Name is null) // [1]
+			string? skipCause = "";
+			if (cToken.IsCancellationRequested)
+				skipCause += $"on {e.RelPath}" + "\n" + "because cancellation was requested";
+			if (e.RelPath is null) // [1]
+				skipCause += "\nbecause its relPath is null";
+			if (e.EventType == Rename && e.OldRelPath is null)
+				skipCause += "\nbecause its oldRelPath is null";
+			if (skipCause != "")
 			{
-				Logger.PrintError(
-					"Evaluator.RunAsync()",
-					$"Got an event with Name set to null (FullPath={e.FullPath}, ChangeType={e.ChangeType})"
-				);
+				this.PrintError($"Skipping the execution of {e.EventType} {skipCause}");
 				continue;
 			}
-			var (topLevelName, rest) = Decompose(e.Name); // [2]
-			if (rest is null)
-				EvaluateTopLevelEvent(e, operationWriter);
+		
+			if (e.RelPath == "whitelist.txt")
+				whitelist = await TryReadWhitelistAsync(cToken) ?? [];
+
+			var tmp = e;
+			if (!whitelist.Contains(e.RelPath!))
+			{
+				if (e.EventType == Rename && whitelist.Contains(e.OldRelPath!))
+					tmp = new Event(null, null, e.OldRelPath, Delete);
+				else
+					continue;
+			}
 			else
 			{
-				if (rest == "whitelist.txt")
-					EvaluateWhitelistEvent(e, topLevelName, operationWriter);
-				else
+				if (e.EventType == Change)
 				{
-					try
-						{ await EvaluateInnerFileEventAsync(e, topLevelName, operationWriter, cToken); }
-					catch (OperationCanceledException)
-						{}
-				}	
+					if (Directory.Exists(Path.Combine(FileManager.SyncPath, e.RelPath!))) // [2]
+						continue;
+					else if (!File.Exists(Path.Combine(FileManager.SyncPath, e.RelPath!)))
+					{
+						this.PrintError($"Could not determine if {e.RelPath} is a directory or a file");
+						continue;
+					}
+				}
 			}
-		}
-	}
-
-	void EvaluateTopLevelEvent(FileSystemEventArgs e, ChannelWriter<DbOperation> operationWriter)
-	{
-		if (e.ChangeType != Deleted && !Directory.Exists(e.FullPath)) // [3]
-		{
-			Logger.PrintError(
-				"Evaluator.EvaluateTopLevelEvent()",
-				$"Either {e.FullPath} does not identify a directory, or an error occurred while trying to determine so."
-			);
-			return;
-		}
-		switch (e.ChangeType)
-		{
-			case Changed:
-				Console.WriteLine("Evaluator.EvaluateTopLevelEvent   rejecting " + e.ChangeType + " on " + e.FullPath);
-				return; // [4]
-			case Created:
-				operationWriter.TryWrite(new AddPendingAction(null, e.Name!, Upload)); // [9]
-				break;
-			case Renamed:
-				var oldName = ((RenamedEventArgs)e).OldName;
-				operationWriter.TryWrite(new AddPendingAction(oldName, e.Name!, Rename));
-				break;
-			case Deleted:
-				operationWriter.TryWrite(new AddPendingAction(null, e.Name!, Delete)); 
-				break;
-			default:
-				Logger.PrintError("Evaluator.EvaluateTopLevelEvent",
-								 $"Unexpected change type \"{e.ChangeType}\" at {e.FullPath}");
-				break;
-		}
-	}
-
-	void EvaluateWhitelistEvent(FileSystemEventArgs e, string topLevelName, ChannelWriter<DbOperation> operationWriter)
-	{
-		switch (e.ChangeType)
-		{
-			case Created: // [5]
-			case Changed:
-			case Renamed: // [6]
-			case Deleted:
-				operationWriter.TryWrite(new AddPendingAction(null, topLevelName, Upload));
-				break;
-			default:
-				Logger.PrintError("Evaluator.EvaluateWhitelistEvent()",
-								 $"Unexpected change type \"{e.ChangeType}\" at {e.FullPath}");
-				break;
-		}
-	}
-
-	async Task EvaluateInnerFileEventAsync(FileSystemEventArgs e, string topLevelName,
-										   ChannelWriter<DbOperation> operationWriter, CancellationToken cToken)
-	{
-		switch (e.ChangeType)
-		{
-			case Created:
-			case Changed:
-			case Deleted:
-				var content = await FileManager.TryReadWhitelistAsync(topLevelName, cToken) ?? "";
-				var whitelist = content.Split(["\r\n", "\n" ], StringSplitOptions.RemoveEmptyEntries);
-				if (Array.Exists(whitelist, x => x == e.Name))
-					operationWriter.TryWrite(new AddPendingAction(null, topLevelName, Upload));
-				else // solo per testing
-					Console.WriteLine("Evaluator.EvaluateInnerFileEventAsync   rejecting " + e.ChangeType + " on " + e.FullPath);
-				break;
-			case Renamed:
-				var tmp = (RenamedEventArgs)e;
-				if (tmp.OldName is not null && Decompose(tmp.OldName).rest == "whitelist.txt") // [7]
-					operationWriter.TryWrite(new AddPendingAction(null, topLevelName, Upload));
-				goto case Created; // [8]
-			default:
-				Logger.PrintError("Evaluator.EvaluateInnerFileEventAsync()",
-								 $"Unexpected change type \"{e.ChangeType}\" at {e.FullPath}");
-				break;
+			operationWriter.TryWrite(new AddEvent(tmp)); // [3]
 		}
 	}
 	
-	(string topLevelName, string? rest) Decompose(string relPath)
+	async Task<string[]?> TryReadWhitelistAsync(CancellationToken cToken)
 	{
-		int i = relPath.IndexOf("\\"); 
-		return (i != -1 ? (relPath.Substring(0,i), relPath.Substring(i+1)) : (relPath, null));
-	}
+		try
+		{
+			return (await FileManager.ReadFileAsync(Path.Combine(FileManager.SyncPath, "whitelist.txt"), cToken))
+					.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
+		}
+		catch (Exception ex)
+			{ this.PrintError(ex); }
+		return null;
+	}		
 }
 
 /*
 	[1]
-		The Name property contains the path at which the event occurred, relative to the path of the directory
-		that is being watched. It is nullable:
+		"e" is an Event object built through a FileSystemEventArgs object. The latter might have the "Name" property
+		(which represents the path at which the filesystem event occurred, relative to the directory being monitored)
+		set to null:
 			https://learn.microsoft.com/en-us/dotnet/api/system.io.filesystemeventargs.name?view=net-10.0#:~:text=The%20Name%20property%20may%20be%20null%20for%20renamed%20events%20if%20the%20FileSystemWatcher%20does%20not%20get%20matching%20old%20and%20new%20name%20events%20from%20the%20OS.
-		and the reasons are not so clear. Anyway, if it is null then we cant do anything. Using FullPath would not solve
-		the issue as its unreliable (as inspecting the source code linked by the above page suggests).
+		and the reasons are not so clear. An inspection of the source code (accessible through the linked page)
+		suggests that using the "FullPath" property would not be a solution.
 	
 	[2]
-		If Name contains something like "A\B\C", then ("A", "B\C") is obtained.
-		if Name contains something like "A", then ("A", null) is obtained.
+		A change over a directory is a change in its content (not metadata). I dont think that is a relevant event.
+		Note that the existence of another event is implied (since the content of the directory changed), and that one
+		may be accepted.
 
 	[3]
-		I dont expect events regarding files in the top level of Sync, but they may erroneously occur.
-		So, I try to filter them out. However, idk how to understand whether a "delete" event concerns a file.
-		Checking for the file extension is not sufficient, as not all files have it. Anyway, note that if the Uploader
-		attempts the deletion of a file, then it will receive a 404 not found unless something other than this program
-		created one such file (with .zip as the extension) on the drive.
-
-	[4]
-		A "changed" event on a directory implies that either its metadata or content changed.
-		If the metadata changed, then we should ignore the event as we dont care about such changes.
-		If the content changed, then a create/change/delete/rename must have happened in the top level of the directory.
-		This implies that another filesystem event has been generated. So, ignoring the directory event is safe even
-		in this case. Not only "safe", it is also "beneficial". Suppose that the "other filesystem event" concerns
-		a non-whitelisted file; we would filter that event out, but if we didnt ignore the directory event and thus
-		required a directory upload, then we would be requiring a useless upload.
-
-	[5]
-		A test shows that using the "mv" command on a non-empty file to transfer it from directory A to directory B
-		produces a "Created" event inside B without any further "Changed" event. One more reason not to ignore the
-		creation event.
-
-	[6]
-		This is a "Renamed" event where the new file name is "whitelist.txt"
-	
-	[7]
-		Basically a deletion of the whitelist file.
-	
-	[8]
-		Now evaluate the new filepath.
-	
-	[9]
-		We know by RunAsync() that this cannot be null.
+		This TryWrite() cannot fail (in the Main, we complete the operationWriter after the Evaluator terminates).
 */
