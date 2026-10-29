@@ -1,6 +1,5 @@
 using Dapper;
 using Microsoft.Data.Sqlite;
-using static DbOperations.ActionType;
 
 namespace DbOperations;
 
@@ -8,59 +7,41 @@ class InitDb : DbOperation
 {
 	internal override void Execute(SqliteConnection connection)
 	{
-		CreatePendingActions(connection);
-		CreateActionCounter(connection);
-		InitializeActionCounter(connection);
+		connection.Execute(
+			"""
+			CREATE TABLE IF NOT EXISTS Events (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				oldRelPath TEXT,
+				relPath TEXT NOT NULL,
+				eventType TEXT NOT NULL
+			);
+			"""
+		); // [1] , [2] , [3]
 	}
 
-	static void CreatePendingActions(SqliteConnection connection)
-	{
-		connection.Execute(
-			$"""
-			CREATE TABLE IF NOT EXISTS PendingActions (
-				relPath TEXT PRIMARY KEY,
-				actionType TEXT NOT NULL CHECK (actionType IN ('{Upload}', '{Delete}')),
-				numAction INTEGER NOT NULL
-			);
-			"""
-		); // [1]
-	}
-	
-	static void CreateActionCounter(SqliteConnection connection)
-	{
-		connection.Execute(
-			"""
-			CREATE TABLE IF NOT EXISTS ActionCounter (
-				n INTEGER NOT NULL
-			);
-			"""
-		);
-	}
-	
-	static void InitializeActionCounter(SqliteConnection connection)
-	{
-		connection.Execute(
-			"""
-			INSERT INTO ActionCounter
-				SELECT 0 WHERE 0 = (SELECT COUNT(*) FROM ActionCounter);
-			"""
-		); // [2]
-	}
+	public override string ToString()
+		=> "InitDb()";
 }
 
 /*
 	[1]
-		numAction serves two purposes:
-			- Persisting the order in which inserts/updates are executed.
-			  This is useful for successfully implementing the "rename" action as an "upload" action followed by
-			  a "delete" action. Check AddPendingAction.cs.
-			- Preventing the Uploader from deleting an action that is newer than the one it just completed.
-			  Suppose that this deletion attempt didnt consider numAction, then it is possible that:
-				- the Uploader starts uploading the zip of folder A
-				- the Evaluator decides that a (new) upload action should be executed on A
-				- the Uploader completes the upload and deletes the row from the table
-			  In this scenario, the choice of the Evaluator is lost.
-
+		"id" possible values are {1, ..., 9223372036854775807}; no value is ever re-used, and at each insertion
+		a value bigger than the max in the table is used (unless the max in the table is 9223372036854775807).
+		It seems highly unrealistic that the table will ever contain 9223372036854775807. By default, SQLite increments
+		the value of "id" by 1; a bigger increment may occur if an error happens. However, suppose that at day x this
+		program is used for the first time, and that it is used (every day) until the end of day y, which occurs
+		100 years later. Also suppose that within each day, "id" increases of 10 millions. By the end of day y
+		the value of "id" would be smaller than 10^7 * 366 * 100 = 366000000000, which is only 3.97 * 10^-6 percent
+		of 9223372036854775807. Check: https://www.sqlite.org/autoinc.html
+	
 	[2]
-		Inserts 0 in ActionCounter if the table is empty, does nothing otherwise.
+		It is important to preserve the order in which records are inserted in this table. Consider what would happen
+		if a file (let it be a.txt) is created and then deleted, but the order in which the Uploader would receive
+		(NULL, "a.txt", Deleted) and (NULL, "a.txt", Created) was random. The "id" attribute serves this purpose.
+		It is also useful to let the Uploader identify the row that it wants to delete.
+
+	[3]
+		For brevity, I skip adding constraints like:
+			- eventType must be either Create, Change, Delete or Rename;
+			- if eventType is "Rename", then oldRelPath must not be null;
 */
